@@ -190,6 +190,11 @@ func (in *EKSClusterConfigStatus) DeepCopyInto(out *EKSClusterConfigStatus) {
 		*out = make([]string, len(*in))
 		copy(*out, *in)
 	}
+	if in.BastionInstanceID != nil {
+		in, out := &in.BastionInstanceID, &out.BastionInstanceID
+		*out = new(string)
+		**out = **in
+	}
 	return
 }
 

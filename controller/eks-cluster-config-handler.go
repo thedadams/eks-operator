@@ -40,6 +40,7 @@ const (
 	eksConfigImportingPhase  = "importing"
 	allOpen                  = "0.0.0.0/0"
 	eksClusterConfigKind     = "EKSClusterConfig"
+	DeployAgentURLKey        = "agentDeployURL"
 )
 
 type Handler struct {
@@ -142,18 +143,6 @@ func (h *Handler) recordError(onChange func(key string, config *eksv1.EKSCluster
 }
 
 func (h *Handler) OnEksConfigRemoved(_ string, config *eksv1.EKSClusterConfig) (*eksv1.EKSClusterConfig, error) {
-	if config.Spec.Imported {
-		logrus.Infof("cluster [%s] is imported, will not delete EKS cluster", config.Name)
-		return config, nil
-	}
-	if config.Status.Phase == eksConfigNotCreatedPhase {
-		// The most likely context here is that the cluster already existed in EKS, so we shouldn't delete it
-		logrus.Warnf("cluster [%s] never advanced to creating status, will not delete EKS cluster", config.Name)
-		return config, nil
-	}
-
-	logrus.Infof("deleting cluster [%s]", config.Name)
-
 	sess, eksService, err := StartAWSSessions(h.secretsCache, config.Spec)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -166,6 +155,24 @@ func (h *Handler) OnEksConfigRemoved(_ string, config *eksv1.EKSClusterConfig) (
 
 	svc := cloudformation.New(sess)
 	ec2Service := ec2.New(sess)
+	if aws.StringValue(config.Status.BastionInstanceID) != "" {
+		logrus.Infof("deleting bastion instance for config: %v", config.Name)
+		if err := deleteBastion(ec2Service, config.Status.BastionInstanceID); err != nil && !notFound(err) {
+			return config, fmt.Errorf("cannot delete bastion instanceL: %v", err)
+		}
+	}
+
+	if config.Spec.Imported {
+		logrus.Infof("cluster [%s] is imported, will not delete EKS cluster", config.Name)
+		return config, nil
+	}
+	if config.Status.Phase == eksConfigNotCreatedPhase {
+		// The most likely context here is that the cluster already existed in EKS, so we shouldn't delete it
+		logrus.Warnf("cluster [%s] never advanced to creating status, will not delete EKS cluster", config.Name)
+		return config, nil
+	}
+
+	logrus.Infof("deleting cluster [%s]", config.Name)
 
 	logrus.Infof("starting node group deletion for config [%s]", config.Spec.DisplayName)
 	waitingForNodegroupDeletion := true
@@ -307,6 +314,36 @@ func (h *Handler) checkAndUpdate(config *eksv1.EKSClusterConfig, eksService *eks
 	upstreamSpec, clusterARN, err := BuildUpstreamClusterState(config.Spec.DisplayName, config.Status.ManagedLaunchTemplateID, clusterState, nodeGroupStates, ec2Service, true)
 	if err != nil {
 		return config, err
+	}
+
+	if config.Annotations[DeployAgentURLKey] != "" && aws.StringValue(config.Status.BastionInstanceID) == "" {
+		ns, id := utils.Parse(config.Spec.AmazonCredentialSecret)
+		accessKey, secretKey, err := getSecretData(h.secretsCache, ns, id)
+		if err != nil {
+			return config, err
+		}
+		instanceID, err := deployAgentWithBastion(
+			ec2Service, upstreamSpec.SecurityGroups, upstreamSpec.Subnets[0], config.Spec.Region, config.Annotations[DeployAgentURLKey], config.Spec.DisplayName, accessKey, secretKey,
+		)
+		if err != nil {
+			return config, fmt.Errorf("error using bastion to deploy agent: %v", err)
+		}
+		config = config.DeepCopy()
+		config.Status.BastionInstanceID = instanceID
+		config, err = h.eksCC.UpdateStatus(config)
+		if err != nil {
+			return config, err
+		}
+	} else if config.Annotations[DeployAgentURLKey] == "" && aws.StringValue(config.Status.BastionInstanceID) != "" {
+		if err := deleteBastion(ec2Service, config.Status.BastionInstanceID); err != nil {
+			return config, err
+		}
+		config = config.DeepCopy()
+		config.Status.BastionInstanceID = nil
+		config, err = h.eksCC.UpdateStatus(config)
+		if err != nil {
+			return config, err
+		}
 	}
 
 	return h.updateUpstreamClusterState(upstreamSpec, config, clusterARN, nodegroupARNs, eksService, ec2Service, svc)
@@ -685,19 +722,10 @@ func StartAWSSessions(secretsCache wranglerv1.SecretCache, spec eksv1.EKSCluster
 
 	ns, id := utils.Parse(spec.AmazonCredentialSecret)
 	if amazonCredentialSecret := spec.AmazonCredentialSecret; amazonCredentialSecret != "" {
-		secret, err := secretsCache.Get(ns, id)
+		accessKey, secretKey, err := getSecretData(secretsCache, ns, id)
 		if err != nil {
 			return nil, nil, err
 		}
-
-		accessKeyBytes := secret.Data["amazonec2credentialConfig-accessKey"]
-		secretKeyBytes := secret.Data["amazonec2credentialConfig-secretKey"]
-		if accessKeyBytes == nil || secretKeyBytes == nil {
-			return nil, nil, fmt.Errorf("invalid aws cloud credential")
-		}
-
-		accessKey := string(accessKeyBytes)
-		secretKey := string(secretKeyBytes)
 
 		awsConfig.Credentials = credentials.NewStaticCredentials(accessKey, secretKey, "")
 	}
@@ -902,7 +930,7 @@ func BuildUpstreamClusterState(name, managedTemplateID string, clusterState *eks
 	// set subnets
 	upstreamSpec.Subnets = aws.StringValueSlice(clusterState.Cluster.ResourcesVpcConfig.SubnetIds)
 	// set security groups
-	upstreamSpec.SecurityGroups = aws.StringValueSlice(clusterState.Cluster.ResourcesVpcConfig.SecurityGroupIds)
+	upstreamSpec.SecurityGroups = aws.StringValueSlice(append(clusterState.Cluster.ResourcesVpcConfig.SecurityGroupIds, clusterState.Cluster.ResourcesVpcConfig.ClusterSecurityGroupId))
 
 	upstreamSpec.SecretsEncryption = aws.Bool(len(clusterState.Cluster.EncryptionConfig) != 0)
 	upstreamSpec.KmsKey = aws.String("")
@@ -1509,4 +1537,19 @@ func filterPublicAccessSources(sources []string) []string {
 		return nil
 	}
 	return sources
+}
+
+func getSecretData(secretsCache wranglerv1.SecretCache, ns, id string) (string, string, error) {
+	secret, err := secretsCache.Get(ns, id)
+	if err != nil {
+		return "", "", err
+	}
+
+	accessKeyBytes := secret.Data["amazonec2credentialConfig-accessKey"]
+	secretKeyBytes := secret.Data["amazonec2credentialConfig-secretKey"]
+	if accessKeyBytes == nil || secretKeyBytes == nil {
+		return "", "", fmt.Errorf("invalid aws cloud credential")
+	}
+
+	return string(accessKeyBytes), string(secretKeyBytes), nil
 }

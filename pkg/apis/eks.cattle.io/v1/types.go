@@ -62,6 +62,8 @@ type EKSClusterConfigStatus struct {
 	// describes how the above network fields were provided. Valid values are provided and generated
 	NetworkFieldsSource string `json:"networkFieldsSource"`
 	FailureMessage      string `json:"failureMessage"`
+	// The EC2 instance used as a bastion to deploy the cluster agent
+	BastionInstanceID *string `json:"bastionInstanceID"`
 }
 
 type NodeGroup struct {

@@ -168,6 +168,9 @@ spec:
           type: object
         status:
           properties:
+            bastionInstanceID:
+              nullable: true
+              type: string
             failureMessage:
               nullable: true
               type: string
